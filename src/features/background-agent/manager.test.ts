@@ -6,6 +6,7 @@ afterAll(() => { mock.restore() })
 import { getSessionPromptParams, clearSessionPromptParams } from "../../shared/session-prompt-params-state"
 import { tmpdir } from "node:os"
 import type { PluginInput } from "@opencode-ai/plugin"
+import * as sharedModule from "../../shared"
 import { _resetForTesting as resetClaudeCodeSessionState, subagentSessions } from "../claude-code-session-state"
 import type { BackgroundTask, ResumeInput } from "./types"
 import { MIN_IDLE_TIME_MS } from "./constants"
@@ -195,7 +196,7 @@ function createBackgroundManager(): BackgroundManager {
   return new BackgroundManager({ pluginContext: { client, directory: tmpdir() } as unknown as PluginInput })
 }
 
-function createBackgroundManagerWithOptions(options: unknown): BackgroundManager {
+function createBackgroundManagerWithOptions(options: Partial<ConstructorParameters<typeof BackgroundManager>[0]>): BackgroundManager {
   const client = {
     session: {
       prompt: async () => ({}),
@@ -203,9 +204,11 @@ function createBackgroundManagerWithOptions(options: unknown): BackgroundManager
       abort: async () => ({}),
     },
   }
-  return new BackgroundManager(
-    { pluginContext: { client, directory: tmpdir() } as unknown as PluginInput, config: undefined, ...options as ConstructorParameters<typeof BackgroundManager>[2] },
-  )
+  return new BackgroundManager({
+    pluginContext: { client, directory: tmpdir() } as unknown as PluginInput,
+    config: undefined,
+    ...options,
+  })
 }
 
 function getConcurrencyManager(manager: BackgroundManager): ConcurrencyManager {
@@ -581,7 +584,7 @@ describe("BackgroundManager retry observability", () => {
     const item: RetryReadyQueueItem = {
       task,
       input: taskInput,
-      attemptId: task.currentAttemptID ?? "att_retry_ready",
+      attemptID: task.currentAttemptID ?? "att_retry_ready",
     }
 
     //#when
@@ -4620,6 +4623,30 @@ describe("BackgroundManager.handleEvent - session.error", () => {
     { providers: ["anthropic"], model: "gpt-5.3-codex", variant: "high" },
   ]
 
+  let logCalls: Array<{ message: string; data?: unknown }> = []
+  let logSpy: ReturnType<typeof spyOn> | undefined
+  let verifySessionExistsSpy: ReturnType<typeof spyOn> | undefined
+
+  beforeEach(() => {
+    logCalls = []
+    logSpy = spyOn(sharedModule, "log").mockImplementation((message: string, data?: unknown) => {
+      logCalls.push({ message, data })
+    })
+  })
+
+  afterEach(() => {
+    logSpy?.mockRestore()
+    verifySessionExistsSpy?.mockRestore()
+  })
+
+  const mockVerifySessionExists = (manager: BackgroundManager, sessionExists: boolean): void => {
+    verifySessionExistsSpy?.mockRestore()
+    verifySessionExistsSpy = spyOn(
+      manager as unknown as { verifySessionExists: (sessionID: string) => Promise<boolean> },
+      "verifySessionExists",
+    ).mockResolvedValue(sessionExists)
+  }
+
   const stubProcessKey = (manager: BackgroundManager) => {
     ;(manager as unknown as { processKey: (key: string) => Promise<void> }).processKey = async () => {}
   }
@@ -4651,6 +4678,7 @@ describe("BackgroundManager.handleEvent - session.error", () => {
   test("sets task to error, releases concurrency, and keeps it until delayed cleanup", async () => {
     //#given
     const manager = createBackgroundManager()
+    mockVerifySessionExists(manager, false)
     const concurrencyManager = getConcurrencyManager(manager)
     const concurrencyKey = "test-provider/test-model"
     await concurrencyManager.acquire(concurrencyKey)
@@ -4699,6 +4727,7 @@ describe("BackgroundManager.handleEvent - session.error", () => {
     //#given
     const { removeTaskCalls, resetToastManager } = createToastRemoveTaskTracker()
     const manager = createBackgroundManager()
+    mockVerifySessionExists(manager, false)
     const sessionID = "ses_error_toast"
     const task = createMockTask({
       id: "task-session-error-toast",
@@ -4770,13 +4799,148 @@ describe("BackgroundManager.handleEvent - session.error", () => {
       manager.handleEvent({
         type: "session.error",
         properties: {
-          sessionID: "ses_unknown",
+          sessionId: "ses_unknown",
           error: { name: "UnknownError", message: "Model not found" },
         },
       })
 
     //#then
     expect(handler).not.toThrow()
+
+    manager.shutdown()
+  })
+
+  test("does not terminate task on session.error when session is still alive", async () => {
+    //#given
+    const manager = createBackgroundManager()
+    mockVerifySessionExists(manager, true)
+
+    const task = createMockTask({
+      id: "task-session-error-alive",
+      sessionId: "ses-alive",
+      parentSessionId: "parent-session",
+      parentMessageId: "msg-alive",
+      description: "task with transient session.error",
+      agent: "explore",
+      status: "running",
+    })
+    getTaskMap(manager).set(task.id, task)
+
+    //#when
+    manager.handleEvent({
+      type: "session.error",
+      properties: {
+        sessionId: task.sessionId,
+        error: {
+          name: "UnknownError",
+          message: "Out of memory",
+        },
+      },
+    })
+
+    await flushBackgroundNotifications()
+
+    //#then
+    expect(task.status).toBe("running")
+    expect(task.error).toBeUndefined()
+    expect(
+      logCalls.some((call) => call.message.includes("session.error received but session still alive")),
+    ).toBe(true)
+
+    manager.shutdown()
+  })
+
+  test("terminates task on session.error when session is gone", async () => {
+    //#given
+    const manager = createBackgroundManager()
+    mockVerifySessionExists(manager, false)
+
+    const task = createMockTask({
+      id: "task-session-error-gone",
+      sessionId: "ses-gone",
+      parentSessionId: "parent-session",
+      parentMessageId: "msg-gone",
+      description: "task with fatal session.error",
+      agent: "explore",
+      status: "running",
+    })
+    getTaskMap(manager).set(task.id, task)
+
+    //#when
+    manager.handleEvent({
+      type: "session.error",
+      properties: {
+        sessionId: task.sessionId,
+        error: {
+          name: "UnknownError",
+          message: "Out of memory",
+        },
+      },
+    })
+
+    await flushBackgroundNotifications()
+
+    //#then
+    expect(task.status).toBe("error")
+    expect(task.error).toBe("Out of memory")
+
+    manager.shutdown()
+  })
+
+  test("completes task on session.idle after transient session.error", async () => {
+    //#given
+    const sessionID = "ses-alive-idle"
+    const client = {
+      session: {
+        prompt: async () => ({}),
+        promptAsync: async () => ({}),
+        abort: async () => ({}),
+        messages: async () => ({
+          data: [
+            {
+              info: { role: "assistant" },
+              parts: [{ type: "text", text: "ok" }],
+            },
+          ],
+        }),
+        todo: async () => ({ data: [] }),
+      },
+    }
+
+    const manager = new BackgroundManager({ pluginContext: { client, directory: tmpdir() } as unknown as PluginInput })
+    stubNotifyParentSession(manager)
+    mockVerifySessionExists(manager, true)
+
+    const task = createMockTask({
+      id: "task-session-error-recovers",
+      sessionId: sessionID,
+      parentSessionId: "parent-session",
+      parentMessageId: "msg-recovers",
+      description: "task that recovers after transient error",
+      agent: "explore",
+      status: "running",
+      startedAt: new Date(Date.now() - (MIN_IDLE_TIME_MS + 10)),
+    })
+    getTaskMap(manager).set(task.id, task)
+
+    //#when
+    manager.handleEvent({
+      type: "session.error",
+      properties: {
+        sessionID,
+        error: {
+          name: "UnknownError",
+          message: "Out of memory",
+        },
+      },
+    })
+    await flushBackgroundNotifications()
+    manager.handleEvent({ type: "session.idle", properties: { sessionID } })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    //#then
+    expect(task.status).toBe("completed")
+    expect(task.error).toBeUndefined()
 
     manager.shutdown()
   })
@@ -6200,8 +6364,8 @@ describe("BackgroundManager attempt lifecycle bindings", () => {
         attemptId: "attempt-1",
         attemptNumber: 1,
         sessionId: "session-attempt-1",
-        providerID: "openai",
-        modelID: "gpt-5.4-mini",
+        providerId: "openai",
+        modelId: "gpt-5.4-mini",
         status: "error",
         error: "first attempt failed",
         startedAt: new Date("2026-04-27T00:00:00.000Z"),
@@ -6211,8 +6375,8 @@ describe("BackgroundManager attempt lifecycle bindings", () => {
         attemptId: "attempt-2",
         attemptNumber: 2,
         sessionId: "session-attempt-2",
-        providerID: "anthropic",
-        modelID: "claude-haiku-4.5",
+        providerId: "anthropic",
+        modelId: "claude-haiku-4.5",
         status: "running",
         startedAt: new Date("2026-04-27T00:00:10.000Z"),
       },
